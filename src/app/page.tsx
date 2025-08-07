@@ -1,7 +1,22 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
-import { Mic, MicOff, Send, Volume2, VolumeX, Settings, MessageCircle } from 'lucide-react';
+import { Mic, MicOff, Send, Settings, MessageCircle } from 'lucide-react';
+import { io, Socket } from 'socket.io-client';
+
+// Types for audio streaming
+interface AudioStreamData {
+  audioChunk: Buffer;
+  isFinal: boolean;
+  timestamp: Date;
+}
+
+interface SpeechRecognitionResult {
+  text: string;
+  confidence: number;
+  isFinal: boolean;
+  timestamp: Date;
+}
 
 interface Message {
   id: string;
@@ -16,18 +31,125 @@ export default function VoiceChatPage() {
   const [inputText, setInputText] = useState('');
   const [isRecording, setIsRecording] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
+  const [isListening, setIsListening] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(true);
+  const [isAITyping, setIsAITyping] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  
+  // Socket.IO and audio refs
+  const socketRef = useRef<Socket | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const streamRef = useRef<MediaStream | null>(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
+  // Initialize Socket.IO connection
+  useEffect(() => {
+    const socket = io('http://localhost:3001');
+    socketRef.current = socket;
+
+    socket.on('connect', () => {
+      console.log('Connected to server');
+      setIsConnected(true);
+      setIsConnecting(false);
+    });
+
+    socket.on('disconnect', () => {
+      console.log('Disconnected from server');
+      setIsConnected(false);
+      setIsConnecting(true);
+      
+      // Attempt to reconnect after 3 seconds
+      setTimeout(() => {
+        if (!socket.connected) {
+          console.log('Attempting to reconnect...');
+          socket.connect();
+        }
+      }, 3000);
+    });
+
+    socket.on('connect_error', (error) => {
+      console.error('Connection error:', error);
+      setIsConnecting(false);
+      setIsConnected(false);
+    });
+
+    // Handle real-time message updates
+    socket.on('message-received', (data) => {
+      console.log('User message received:', data);
+      setMessages(prev => [...prev, data.message]);
+    });
+
+    socket.on('ai-typing', (data) => {
+      console.log('AI typing status:', data.isTyping);
+      setIsAITyping(data.isTyping);
+    });
+
+    socket.on('ai-response', (data) => {
+      console.log('AI response received:', data);
+      setMessages(prev => [...prev, data.message]);
+      
+      // Play audio response if available
+      if (data.audioBuffer) {
+        playAudioResponse(data.audioBuffer);
+      }
+    });
+
+    // Legacy event handlers (for backward compatibility)
+    socket.on('conversation-update', (data) => {
+      console.log('Conversation update received:', data);
+      setMessages(data.messages);
+    });
+
+    socket.on('speech-result', (result: SpeechRecognitionResult) => {
+      console.log('Speech recognition result:', result);
+      if (result.isFinal) {
+        const newMessage: Message = {
+          id: Date.now().toString(),
+          text: result.text,
+          sender: 'user',
+          timestamp: new Date(),
+          isVoice: true,
+        };
+        setMessages(prev => [...prev, newMessage]);
+      }
+    });
+
+    socket.on('error', (error) => {
+      console.error('Socket error:', error);
+    });
+
+    return () => {
+      socket.disconnect();
+    };
+  }, []);
+
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
 
+  // Play audio response from base64
+  const playAudioResponse = (audioBuffer: string) => {
+    try {
+      const audioBlob = new Blob([Buffer.from(audioBuffer, 'base64')], { type: 'audio/mp3' });
+      const audioUrl = URL.createObjectURL(audioBlob);
+      const audio = new Audio(audioUrl);
+      audio.play();
+      
+      // Clean up URL after playing
+      audio.onended = () => {
+        URL.revokeObjectURL(audioUrl);
+      };
+    } catch (error) {
+      console.error('Error playing audio:', error);
+    }
+  };
+
   const handleSendMessage = () => {
-    if (!inputText.trim()) return;
+    if (!inputText.trim() || !socketRef.current) return;
 
     const newMessage: Message = {
       id: Date.now().toString(),
@@ -37,26 +159,133 @@ export default function VoiceChatPage() {
     };
 
     setMessages(prev => [...prev, newMessage]);
+    
+    // Send text message to server
+    socketRef.current.emit('text-message', {
+      text: inputText,
+      timestamp: new Date()
+    });
+    
     setInputText('');
+  };
 
-    // Simulate AI response
-    setTimeout(() => {
-      const aiResponse: Message = {
-        id: (Date.now() + 1).toString(),
-        text: 'I received your message: "' + inputText + '". This is a demo response.',
-        sender: 'ai',
-        timestamp: new Date(),
+  const startRecording = async () => {
+    try {
+      console.log('🎤 Requesting microphone access...');
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      console.log('✅ Microphone access granted');
+      
+      // Check supported MIME types
+      const supportedTypes = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
+        ? 'audio/webm;codecs=opus' 
+        : MediaRecorder.isTypeSupported('audio/webm') 
+        ? 'audio/webm' 
+        : 'audio/mp4';
+      
+      console.log('📊 Using MIME type:', supportedTypes);
+      
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: supportedTypes
+      });
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
+
+      mediaRecorder.ondataavailable = async (event) => {
+        console.log('📦 MediaRecorder data available:', {
+          size: event.data.size,
+          type: event.data.type,
+          timestamp: new Date().toISOString()
+        });
+        
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+          
+          // Convert the audio chunk to buffer and send to server
+          const arrayBuffer = await event.data.arrayBuffer();
+          const buffer = Buffer.from(arrayBuffer);
+          
+          // Send audio chunk to server in real-time
+          if (socketRef.current) {
+            console.log('🎤 Sending audio chunk to server:', {
+              size: buffer.length,
+              timestamp: new Date().toISOString()
+            });
+            
+            socketRef.current.emit('audio-stream', {
+              audioChunk: buffer,
+              isFinal: false,
+              timestamp: new Date()
+            });
+          }
+        } else {
+          console.log('⚠️ Empty audio chunk received');
+        }
       };
-      setMessages(prev => [...prev, aiResponse]);
-    }, 1000);
+
+      mediaRecorder.onstop = async () => {
+        // Send final chunk to indicate recording is complete
+        if (socketRef.current) {
+          console.log('🏁 Sending final audio chunk to server');
+          
+          socketRef.current.emit('audio-stream', {
+            audioChunk: Buffer.alloc(0), // Empty buffer to indicate end
+            isFinal: true,
+            timestamp: new Date()
+          });
+        }
+      };
+
+      // Start recording
+      mediaRecorder.start(1000); // Collect data every second
+      setIsRecording(true);
+      setIsListening(true);
+      
+      // Notify server that recording started
+      if (socketRef.current) {
+        socketRef.current.emit('start-recording');
+      }
+      
+      console.log('🎙️ Started recording with MediaRecorder');
+      console.log('   📊 Recording settings:', {
+        mimeType: mediaRecorder.mimeType,
+        state: mediaRecorder.state,
+        timeslice: 1000
+      });
+    } catch (error) {
+      console.error('❌ Error starting recording:', error);
+      if (error instanceof Error) {
+        console.error('   Details:', {
+          error: error.message,
+          name: error.name,
+          stack: error.stack
+        });
+      }
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && streamRef.current) {
+      mediaRecorderRef.current.stop();
+      streamRef.current.getTracks().forEach(track => track.stop());
+      setIsRecording(false);
+      setIsListening(false);
+      
+      // Notify server that recording stopped
+      if (socketRef.current) {
+        socketRef.current.emit('stop-recording');
+      }
+      
+      console.log('⏹️ Stopped recording');
+      console.log('   📊 Total chunks recorded:', audioChunksRef.current.length);
+    }
   };
 
   const toggleRecording = () => {
-    setIsRecording(!isRecording);
-    if (!isRecording) {
-      console.log('Started recording...');
+    if (isRecording) {
+      stopRecording();
     } else {
-      console.log('Stopped recording...');
+      startRecording();
     }
   };
 
@@ -68,6 +297,41 @@ export default function VoiceChatPage() {
       handleSendMessage();
     }
   };
+
+  // Loading screen component
+  const LoadingScreen = () => (
+    <div style={{ 
+      minHeight: '100vh', 
+      background: '#f8f9fa', 
+      display: 'flex', 
+      alignItems: 'center', 
+      justifyContent: 'center',
+      flexDirection: 'column',
+      gap: '1rem'
+    }}>
+      <div style={{
+        width: '60px',
+        height: '60px',
+        border: '3px solid #e5e7eb',
+        borderTop: '3px solid #007aff',
+        borderRadius: '50%',
+        animation: 'spin 1s linear infinite'
+      }} />
+      <div style={{ textAlign: 'center' }}>
+        <h2 style={{ fontSize: '1.25rem', fontWeight: '600', color: '#1d1d1f', marginBottom: '0.5rem' }}>
+          Connecting to AI Assistant
+        </h2>
+        <p style={{ color: '#6b7280', fontSize: '0.875rem' }}>
+          Establishing secure connection...
+        </p>
+      </div>
+    </div>
+  );
+
+  // Show loading screen while connecting
+  if (isConnecting) {
+    return <LoadingScreen />;
+  }
 
   return (
     <div style={{ minHeight: '100vh', background: '#f8f9fa', color: '#1d1d1f' }}>
@@ -108,10 +372,11 @@ export default function VoiceChatPage() {
                 width: '8px', 
                 height: '8px', 
                 borderRadius: '50%', 
-                background: isConnected ? '#34d399' : '#ef4444' 
+                background: isConnected ? '#34d399' : '#ef4444',
+                animation: isConnecting ? 'pulse 2s infinite' : 'none'
               }} />
               <span style={{ fontSize: '0.875rem', color: '#6b7280' }}>
-                {isConnected ? 'Online' : 'Offline'}
+                {isConnecting ? 'Connecting...' : isConnected ? 'Online' : 'Offline'}
               </span>
             </div>
             
@@ -232,7 +497,7 @@ export default function VoiceChatPage() {
                         : '0 1px 3px rgba(0, 0, 0, 0.1)'
                     }}>
                       <div style={{ display: 'flex', alignItems: 'flex-start', gap: '0.5rem' }}>
-                        {message.isVoice && <Volume2 size={16} />}
+                        {message.isVoice && <Mic size={16} />}
                         <p style={{ fontSize: '0.875rem', lineHeight: '1.4' }}>{message.text}</p>
                       </div>
                       <p style={{ 
@@ -246,6 +511,54 @@ export default function VoiceChatPage() {
                     </div>
                   </div>
                 ))}
+                
+                {/* AI Typing Indicator */}
+                {isAITyping && (
+                  <div style={{ display: 'flex', justifyContent: 'flex-start' }}>
+                    <div style={{
+                      maxWidth: '75%',
+                      padding: '0.75rem 1rem',
+                      borderRadius: '18px',
+                      background: '#f3f4f6',
+                      color: '#1d1d1f',
+                      boxShadow: '0 1px 3px rgba(0, 0, 0, 0.1)'
+                    }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                        <div style={{
+                          display: 'flex',
+                          gap: '4px',
+                          alignItems: 'center'
+                        }}>
+                          <div style={{
+                            width: '8px',
+                            height: '8px',
+                            borderRadius: '50%',
+                            background: '#007aff',
+                            animation: 'pulse 1.4s ease-in-out infinite both'
+                          }} />
+                          <div style={{
+                            width: '8px',
+                            height: '8px',
+                            borderRadius: '50%',
+                            background: '#007aff',
+                            animation: 'pulse 1.4s ease-in-out infinite both',
+                            animationDelay: '0.2s'
+                          }} />
+                          <div style={{
+                            width: '8px',
+                            height: '8px',
+                            borderRadius: '50%',
+                            background: '#007aff',
+                            animation: 'pulse 1.4s ease-in-out infinite both',
+                            animationDelay: '0.4s'
+                          }} />
+                        </div>
+                        <span style={{ fontSize: '0.875rem', color: '#6b7280' }}>AI is thinking...</span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+                
                 <div ref={messagesEndRef} />
               </div>
             )}
@@ -266,20 +579,22 @@ export default function VoiceChatPage() {
                   value={inputText}
                   onChange={(e) => setInputText(e.target.value)}
                   onKeyPress={handleKeyPress}
-                  placeholder="Type a message..."
+                  placeholder={isConnected ? "Type a message..." : "Connecting to server..."}
+                  disabled={!isConnected}
                   style={{
                     width: '100%',
-                    background: '#f8f9fa',
+                    background: isConnected ? '#f8f9fa' : '#f3f4f6',
                     border: '1px solid #e5e7eb',
                     borderRadius: '20px',
                     padding: '0.75rem 1rem',
-                    color: '#1d1d1f',
+                    color: isConnected ? '#1d1d1f' : '#9ca3af',
                     resize: 'none',
                     minHeight: '44px',
                     maxHeight: '120px',
                     fontSize: '0.875rem',
                     outline: 'none',
-                    transition: 'border-color 0.2s'
+                    transition: 'border-color 0.2s',
+                    cursor: isConnected ? 'text' : 'not-allowed'
                   }}
                   rows={1}
                 />
@@ -288,21 +603,21 @@ export default function VoiceChatPage() {
               {/* Send Button */}
               <button
                 onClick={handleSendMessage}
-                disabled={!inputText.trim()}
+                disabled={!inputText.trim() || !isConnected}
                 style={{
                   padding: '0.75rem',
                   borderRadius: '50%',
-                  background: inputText.trim() ? '#007aff' : '#e5e7eb',
-                  color: inputText.trim() ? '#ffffff' : '#9ca3af',
+                  background: inputText.trim() && isConnected ? '#007aff' : '#e5e7eb',
+                  color: inputText.trim() && isConnected ? '#ffffff' : '#9ca3af',
                   border: 'none',
-                  cursor: inputText.trim() ? 'pointer' : 'not-allowed',
+                  cursor: inputText.trim() && isConnected ? 'pointer' : 'not-allowed',
                   width: '44px',
                   height: '44px',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
                   transition: 'all 0.2s',
-                  boxShadow: inputText.trim() ? '0 2px 8px rgba(0, 122, 255, 0.3)' : 'none'
+                  boxShadow: inputText.trim() && isConnected ? '0 2px 8px rgba(0, 122, 255, 0.3)' : 'none'
                 }}
               >
                 <Send size={20} />
@@ -311,20 +626,21 @@ export default function VoiceChatPage() {
               {/* Voice Chat Button */}
               <button
                 onClick={toggleRecording}
+                disabled={!isConnected}
                 style={{
                   padding: '0.75rem',
                   borderRadius: '50%',
-                  background: isRecording ? '#ef4444' : '#007aff',
+                  background: !isConnected ? '#e5e7eb' : isRecording ? '#ef4444' : '#007aff',
                   color: '#ffffff',
                   border: 'none',
-                  cursor: 'pointer',
+                  cursor: isConnected ? 'pointer' : 'not-allowed',
                   width: '44px',
                   height: '44px',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
                   transition: 'all 0.2s',
-                  boxShadow: isRecording 
+                  boxShadow: !isConnected ? 'none' : isRecording 
                     ? '0 2px 8px rgba(239, 68, 68, 0.3)' 
                     : '0 2px 8px rgba(0, 122, 255, 0.3)'
                 }}
@@ -340,6 +656,7 @@ export default function VoiceChatPage() {
               fontSize: '0.75rem' 
             }}>
               {isRecording ? 'Listening...' : 'Tap to start voice chat'}
+              {isListening && <div style={{ marginTop: '0.25rem', color: '#007aff' }}>🎤 Recording audio...</div>}
             </div>
           </div>
         </div>
