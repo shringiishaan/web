@@ -100,9 +100,12 @@ export default function VoiceChatPage() {
       };
       setMessages(prev => [...prev, messageWithDate]);
       
-      // Play audio response if available
+      // Play audio response automatically
       if (data.audioBuffer) {
+        console.log('🔊 Playing AI audio response...');
         playAudioResponse(data.audioBuffer);
+      } else {
+        console.log('⚠️ No audio buffer received from AI response');
       }
     });
 
@@ -146,17 +149,30 @@ export default function VoiceChatPage() {
   // Play audio response from base64
   const playAudioResponse = (audioBuffer: string) => {
     try {
+      console.log('🔊 Creating audio blob from base64...');
       const audioBlob = new Blob([Buffer.from(audioBuffer, 'base64')], { type: 'audio/mp3' });
       const audioUrl = URL.createObjectURL(audioBlob);
       const audio = new Audio(audioUrl);
-      audio.play();
+      
+      console.log('🔊 Starting audio playback...');
+      audio.play().then(() => {
+        console.log('✅ Audio playback started successfully');
+      }).catch((error) => {
+        console.error('❌ Error starting audio playback:', error);
+      });
       
       // Clean up URL after playing
       audio.onended = () => {
+        console.log('🔊 Audio playback completed');
+        URL.revokeObjectURL(audioUrl);
+      };
+      
+      audio.onerror = (error) => {
+        console.error('❌ Audio playback error:', error);
         URL.revokeObjectURL(audioUrl);
       };
     } catch (error) {
-      console.error('Error playing audio:', error);
+      console.error('❌ Error creating audio blob:', error);
     }
   };
 
