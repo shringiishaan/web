@@ -159,43 +159,11 @@ export default function VoiceChatPage() {
     if (!isSilenceTriggered) {
       stopRecording();
     } else {
-      // For silence-triggered processing, stop and restart MediaRecorder
+      // For silence-triggered processing, pause recording until AI response is complete
       if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+        console.log('⏸️ Pausing recording for AI processing...');
         mediaRecorderRef.current.stop();
-        
-        // Restart MediaRecorder for next recording session
-        setTimeout(() => {
-          if (isRecordingRef.current && streamRef.current) {
-            console.log('🔄 Restarting MediaRecorder for next session...');
-            
-            // Create new MediaRecorder
-            const supportedTypes = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
-              ? 'audio/webm;codecs=opus' 
-              : MediaRecorder.isTypeSupported('audio/webm') 
-              ? 'audio/webm' 
-              : 'audio/mp4';
-            
-            const newMediaRecorder = new MediaRecorder(streamRef.current, {
-              mimeType: supportedTypes
-            });
-            
-            mediaRecorderRef.current = newMediaRecorder;
-            audioChunksRef.current = [];
-
-            newMediaRecorder.ondataavailable = async (event) => {
-              if (event.data.size > 0) {
-                audioChunksRef.current.push(event.data);
-                // Only log every 10th chunk to reduce console spam
-                if (audioChunksRef.current.length % 10 === 0) {
-                  console.log('📦 MediaRecorder chunks collected:', audioChunksRef.current.length);
-                }
-              }
-            };
-
-            newMediaRecorder.start(100);
-            console.log('✅ MediaRecorder restarted successfully');
-          }
-        }, 100); // Small delay to ensure clean restart
+        isRecordingRef.current = false; // Pause recording state
       }
     }
   };
@@ -303,6 +271,41 @@ export default function VoiceChatPage() {
     scrollToBottom();
   }, [messages]);
 
+  // Resume recording after AI response
+  const resumeRecording = () => {
+    if (!isRecordingRef.current && streamRef.current) {
+      console.log('🔄 Resuming recording after AI response...');
+      
+      // Create new MediaRecorder
+      const supportedTypes = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
+        ? 'audio/webm;codecs=opus' 
+        : MediaRecorder.isTypeSupported('audio/webm') 
+        ? 'audio/webm' 
+        : 'audio/mp4';
+      
+      const newMediaRecorder = new MediaRecorder(streamRef.current, {
+        mimeType: supportedTypes
+      });
+      
+      mediaRecorderRef.current = newMediaRecorder;
+      audioChunksRef.current = [];
+
+      newMediaRecorder.ondataavailable = async (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+          // Only log every 10th chunk to reduce console spam
+          if (audioChunksRef.current.length % 10 === 0) {
+            console.log('📦 MediaRecorder chunks collected:', audioChunksRef.current.length);
+          }
+        }
+      };
+
+      newMediaRecorder.start(100);
+      isRecordingRef.current = true;
+      console.log('✅ Recording resumed successfully');
+    }
+  };
+
   // Play audio response from base64
   const playAudioResponse = (audioBuffer: string) => {
     try {
@@ -316,20 +319,28 @@ export default function VoiceChatPage() {
         console.log('✅ Audio playback started successfully');
       }).catch((error) => {
         console.error('❌ Error starting audio playback:', error);
+        // Resume recording even if audio fails
+        resumeRecording();
       });
       
-      // Clean up URL after playing
+      // Clean up URL after playing and resume recording
       audio.onended = () => {
         console.log('🔊 Audio playback completed');
         URL.revokeObjectURL(audioUrl);
+        // Resume recording after TTS completes
+        resumeRecording();
       };
       
       audio.onerror = (error) => {
         console.error('❌ Audio playback error:', error);
         URL.revokeObjectURL(audioUrl);
+        // Resume recording even if audio fails
+        resumeRecording();
       };
     } catch (error) {
       console.error('❌ Error creating audio blob:', error);
+      // Resume recording even if audio fails
+      resumeRecording();
     }
   };
 
