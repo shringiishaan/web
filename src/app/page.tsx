@@ -34,6 +34,9 @@ export default function VoiceChatPage() {
   const [isListening, setIsListening] = useState(false);
   const [isConnecting, setIsConnecting] = useState(true);
   const [isAITyping, setIsAITyping] = useState(false);
+  const [isUserSpeaking, setIsUserSpeaking] = useState(false);
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [isProcessingAudio, setIsProcessingAudio] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   
   // Socket.IO and audio refs
@@ -41,9 +44,85 @@ export default function VoiceChatPage() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const microphoneRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  // Voice Activity Detection
+  const analyzeAudioLevel = () => {
+    if (!analyserRef.current) return;
+
+    const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
+    analyserRef.current.getByteFrequencyData(dataArray);
+
+    // Calculate average volume level
+    const average = dataArray.reduce((acc, value) => acc + value, 0) / dataArray.length;
+    const normalizedLevel = average / 255; // Normalize to 0-1
+
+    setAudioLevel(normalizedLevel);
+
+    // Detect if user is speaking (threshold can be adjusted)
+    const isSpeaking = normalizedLevel > 0.1; // 10% threshold
+    setIsUserSpeaking(isSpeaking);
+
+    // Reset silence timer if speaking
+    if (isSpeaking) {
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+      }
+    } else {
+      // Start silence timer if not speaking
+      if (!silenceTimerRef.current && isRecording) {
+        silenceTimerRef.current = setTimeout(() => {
+          console.log('🔇 Silence detected, processing audio...');
+          processAudioChunks();
+        }, 2000); // 2 seconds of silence
+      }
+    }
+
+    // Continue analyzing
+    animationFrameRef.current = requestAnimationFrame(analyzeAudioLevel);
+  };
+
+  // Process accumulated audio chunks
+  const processAudioChunks = () => {
+    if (audioChunksRef.current.length === 0) return;
+
+    console.log('📦 Processing accumulated audio chunks...');
+    
+    // Set processing state
+    setIsProcessingAudio(true);
+    
+    // Combine all chunks
+    const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+    
+    // Convert to buffer and send to server
+    audioBlob.arrayBuffer().then((arrayBuffer) => {
+      const buffer = Buffer.from(arrayBuffer);
+      
+      if (socketRef.current) {
+        console.log('📤 Sending complete audio to server:', {
+          size: buffer.length,
+          chunks: audioChunksRef.current.length,
+          timestamp: new Date().toISOString()
+        });
+        
+        socketRef.current.emit('audio-stream', {
+          audioChunk: buffer,
+          isFinal: true,
+          timestamp: new Date()
+        });
+      }
+    });
+
+    // Clear chunks for next recording
+    audioChunksRef.current = [];
   };
 
   // Initialize Socket.IO connection
@@ -99,6 +178,9 @@ export default function VoiceChatPage() {
         timestamp: new Date(data.message.timestamp)
       };
       setMessages(prev => [...prev, messageWithDate]);
+      
+      // Reset processing state
+      setIsProcessingAudio(false);
       
       // Play audio response automatically
       if (data.audioBuffer) {
@@ -204,6 +286,21 @@ export default function VoiceChatPage() {
       streamRef.current = stream;
       console.log('✅ Microphone access granted');
       
+      // Set up audio analysis for voice activity detection
+      const audioContext = new AudioContext();
+      audioContextRef.current = audioContext;
+      
+      const analyser = audioContext.createAnalyser();
+      analyserRef.current = analyser;
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.8;
+      
+      const microphone = audioContext.createMediaStreamSource(stream);
+      microphoneRef.current = microphone;
+      microphone.connect(analyser);
+      
+      console.log('🎵 Audio analysis setup complete');
+      
       // Check supported MIME types
       const supportedTypes = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
         ? 'audio/webm;codecs=opus' 
@@ -220,65 +317,29 @@ export default function VoiceChatPage() {
       audioChunksRef.current = [];
 
       mediaRecorder.ondataavailable = async (event) => {
-        console.log('📦 MediaRecorder data available:', {
-          size: event.data.size,
-          type: event.data.type,
-          timestamp: new Date().toISOString()
-        });
-        
         if (event.data.size > 0) {
           audioChunksRef.current.push(event.data);
-          
-          // Convert the audio chunk to buffer and send to server
-          const arrayBuffer = await event.data.arrayBuffer();
-          const buffer = Buffer.from(arrayBuffer);
-          
-          // Send audio chunk to server in real-time
-          if (socketRef.current) {
-            console.log('🎤 Sending audio chunk to server:', {
-              size: buffer.length,
-              timestamp: new Date().toISOString()
-            });
-            
-            socketRef.current.emit('audio-stream', {
-              audioChunk: buffer,
-              isFinal: false,
-              timestamp: new Date()
-            });
-          }
-        } else {
-          console.log('⚠️ Empty audio chunk received');
         }
       };
 
-      mediaRecorder.onstop = async () => {
-        // Send final chunk to indicate recording is complete
-        if (socketRef.current) {
-          console.log('🏁 Sending final audio chunk to server');
-          
-          socketRef.current.emit('audio-stream', {
-            audioChunk: Buffer.alloc(0), // Empty buffer to indicate end
-            isFinal: true,
-            timestamp: new Date()
-          });
-        }
-      };
-
-      // Start recording
-      mediaRecorder.start(1000); // Collect data every second
+      // Start recording with smaller timeslice for better responsiveness
+      mediaRecorder.start(100); // Collect data every 100ms for smoother analysis
       setIsRecording(true);
       setIsListening(true);
+      
+      // Start voice activity detection
+      analyzeAudioLevel();
       
       // Notify server that recording started
       if (socketRef.current) {
         socketRef.current.emit('start-recording');
       }
       
-      console.log('🎙️ Started recording with MediaRecorder');
+      console.log('🎙️ Started recording with voice activity detection');
       console.log('   📊 Recording settings:', {
         mimeType: mediaRecorder.mimeType,
         state: mediaRecorder.state,
-        timeslice: 1000
+        timeslice: 100
       });
     } catch (error) {
       console.error('❌ Error starting recording:', error);
@@ -294,17 +355,45 @@ export default function VoiceChatPage() {
 
   const stopRecording = () => {
     if (mediaRecorderRef.current && streamRef.current) {
+      // Stop voice activity detection
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
+      }
+      
+      // Clear silence timer
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = null;
+      }
+      
+      // Stop recording
       mediaRecorderRef.current.stop();
       streamRef.current.getTracks().forEach(track => track.stop());
+      
+      // Clean up audio context
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+        audioContextRef.current = null;
+      }
+      
+      // Reset states
       setIsRecording(false);
       setIsListening(false);
+      setIsUserSpeaking(false);
+      setAudioLevel(0);
+      
+      // Process any remaining audio chunks
+      if (audioChunksRef.current.length > 0) {
+        processAudioChunks();
+      }
       
       // Notify server that recording stopped
       if (socketRef.current) {
         socketRef.current.emit('stop-recording');
       }
       
-      console.log('⏹️ Stopped recording');
+      console.log('⏹️ Stopped recording and cleaned up audio analysis');
       console.log('   📊 Total chunks recorded:', audioChunksRef.current.length);
     }
   };
@@ -586,6 +675,53 @@ export default function VoiceChatPage() {
                     </div>
                   </div>
                 )}
+
+                {/* Audio Processing Indicator */}
+                {isProcessingAudio && (
+                  <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                    <div style={{
+                      maxWidth: '75%',
+                      padding: '0.75rem 1rem',
+                      borderRadius: '18px',
+                      background: '#007aff',
+                      color: '#ffffff',
+                      boxShadow: '0 2px 8px rgba(0, 122, 255, 0.3)'
+                    }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                        <div style={{
+                          display: 'flex',
+                          gap: '4px',
+                          alignItems: 'center'
+                        }}>
+                          <div style={{
+                            width: '8px',
+                            height: '8px',
+                            borderRadius: '50%',
+                            background: '#ffffff',
+                            animation: 'pulse 1.4s ease-in-out infinite both'
+                          }} />
+                          <div style={{
+                            width: '8px',
+                            height: '8px',
+                            borderRadius: '50%',
+                            background: '#ffffff',
+                            animation: 'pulse 1.4s ease-in-out infinite both',
+                            animationDelay: '0.2s'
+                          }} />
+                          <div style={{
+                            width: '8px',
+                            height: '8px',
+                            borderRadius: '50%',
+                            background: '#ffffff',
+                            animation: 'pulse 1.4s ease-in-out infinite both',
+                            animationDelay: '0.4s'
+                          }} />
+                        </div>
+                        <span style={{ fontSize: '0.875rem', color: '#ffffff' }}>Processing audio...</span>
+                      </div>
+                    </div>
+                  </div>
+                )}
                 
                 <div ref={messagesEndRef} />
               </div>
@@ -658,7 +794,8 @@ export default function VoiceChatPage() {
                 style={{
                   padding: '0.75rem',
                   borderRadius: '50%',
-                  background: !isConnected ? '#e5e7eb' : isRecording ? '#ef4444' : '#007aff',
+                  background: !isConnected ? '#e5e7eb' : 
+                    isRecording ? (isUserSpeaking ? '#10b981' : '#ef4444') : '#007aff',
                   color: '#ffffff',
                   border: 'none',
                   cursor: isConnected ? 'pointer' : 'not-allowed',
@@ -668,12 +805,15 @@ export default function VoiceChatPage() {
                   alignItems: 'center',
                   justifyContent: 'center',
                   transition: 'all 0.2s',
-                  boxShadow: !isConnected ? 'none' : isRecording 
-                    ? '0 2px 8px rgba(239, 68, 68, 0.3)' 
+                  transform: isUserSpeaking ? 'scale(1.1)' : 'scale(1)',
+                  boxShadow: !isConnected ? 'none' : 
+                    isRecording ? (isUserSpeaking 
+                      ? '0 2px 8px rgba(16, 185, 129, 0.4)' 
+                      : '0 2px 8px rgba(239, 68, 68, 0.3)') 
                     : '0 2px 8px rgba(0, 122, 255, 0.3)'
                 }}
               >
-                {isRecording ? <MicOff size={20} /> : <Mic size={20} />}
+                {isRecording ? <Mic size={20} /> : <MicOff size={20} />}
               </button>
             </div>
             
@@ -683,8 +823,20 @@ export default function VoiceChatPage() {
               color: '#6b7280', 
               fontSize: '0.75rem' 
             }}>
-              {isRecording ? 'Listening...' : 'Tap to start voice chat'}
-              {isListening && <div style={{ marginTop: '0.25rem', color: '#007aff' }}>🎤 Recording audio...</div>}
+              {isProcessingAudio ? '⏳ Processing audio...' :
+                isRecording ? 
+                  (isUserSpeaking ? '🎤 Speaking...' : '🔇 Listening for speech...') 
+                  : 'Tap to start voice chat'
+              }
+              {isListening && !isProcessingAudio && (
+                <div style={{ 
+                  marginTop: '0.25rem', 
+                  color: isUserSpeaking ? '#10b981' : '#007aff',
+                  fontWeight: isUserSpeaking ? '600' : '400'
+                }}>
+                  {isUserSpeaking ? '🎤 Voice detected!' : '🎤 Recording audio...'}
+                </div>
+              )}
             </div>
           </div>
         </div>
