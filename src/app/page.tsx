@@ -80,7 +80,11 @@ export default function VoiceChatPage() {
     // Handle real-time message updates
     socket.on('message-received', (data) => {
       console.log('User message received:', data);
-      setMessages(prev => [...prev, data.message]);
+      const messageWithDate = {
+        ...data.message,
+        timestamp: new Date(data.message.timestamp)
+      };
+      setMessages(prev => [...prev, messageWithDate]);
     });
 
     socket.on('ai-typing', (data) => {
@@ -90,7 +94,11 @@ export default function VoiceChatPage() {
 
     socket.on('ai-response', (data) => {
       console.log('AI response received:', data);
-      setMessages(prev => [...prev, data.message]);
+      const messageWithDate = {
+        ...data.message,
+        timestamp: new Date(data.message.timestamp)
+      };
+      setMessages(prev => [...prev, messageWithDate]);
       
       // Play audio response if available
       if (data.audioBuffer) {
@@ -101,7 +109,11 @@ export default function VoiceChatPage() {
     // Legacy event handlers (for backward compatibility)
     socket.on('conversation-update', (data) => {
       console.log('Conversation update received:', data);
-      setMessages(data.messages);
+      const messagesWithDates = data.messages.map((message: any) => ({
+        ...message,
+        timestamp: new Date(message.timestamp)
+      }));
+      setMessages(messagesWithDates);
     });
 
     socket.on('speech-result', (result: SpeechRecognitionResult) => {
